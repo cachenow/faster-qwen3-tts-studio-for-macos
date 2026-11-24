@@ -32,5 +32,9 @@ jobs:
         run: |
           version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
           test "$RELEASE_TAG" = "v$version"
-          gh release create "$RELEASE_TAG" --verify-tag --prerelease --notes-file CHANGELOG.md \
+          notes=(--generate-notes)
+          if [[ -f CHANGELOG.md ]]; then
+            notes=(--notes-file CHANGELOG.md)
+          fi
+          gh release create "$RELEASE_TAG" --verify-tag --prerelease "${notes[@]}" \
             artifacts/*.dmg artifacts/*.app.zip artifacts/SHA256SUMS.txt artifacts/BUILD-REPORT.txt
