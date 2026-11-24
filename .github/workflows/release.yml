@@ -21,7 +21,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v7
         with:
           name: Faster-Qwen3-TTS-Studio-arm64
           path: artifacts

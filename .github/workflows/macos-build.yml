@@ -24,8 +24,9 @@ jobs:
       - run: bash scripts/build/macos.sh
         env:
           RUSTUP_TOOLCHAIN: 1.93.0
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: Faster-Qwen3-TTS-Studio-arm64
           path: artifacts/
+          compression-level: 0
           if-no-files-found: error
