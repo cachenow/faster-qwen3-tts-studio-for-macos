@@ -98,3 +98,24 @@ def test_dialogue_workspace_survives_restart(tmp_path):
         assert client.get("/api/v1/workspaces/dialogue").json() == saved
         assert client.get("/api/v1/workspaces/batch").json() is None
         assert client.get("/api/v1/settings").json() == {"theme": "dark", "locale": "en"}
+
+
+def test_clean_unused_references_and_reset(tmp_path):
+    with TestClient(create_app(tmp_path, "test"), base_url="http://127.0.0.1:1234",
+                    headers={"Authorization":"Bearer test"}) as client:
+        data = io.BytesIO()
+        with wave.open(data, "wb") as wav:
+            wav.setparams((1, 2, 24000, 0, "NONE", ""))
+            wav.writeframes(b"\x00\x00" * 2400)
+        def upload():
+            return client.post("/api/v1/references", files={"file": ("ref.wav", data.getvalue())}).json()["id"]
+        used, unused = upload(), upload()
+        client.post("/api/v1/voices", json={"name":"Keep","reference":used,"xvec":True}).raise_for_status()
+        client.post("/api/v1/storage/clear", json=["unused"]).raise_for_status()
+        assert client.get(f"/api/v1/references/{used}/audio").is_success
+        assert client.get(f"/api/v1/references/{unused}/audio").status_code == 404
+        client.post("/api/v1/storage/clear", json=["voices","outputs","settings","workspaces"]).raise_for_status()
+        assert client.get("/api/v1/voices").json() == []
+        assert not list((tmp_path / "voices").iterdir())
+        assert client.get("/api/v1/storage").json()["voices"] == 0
+        assert client.post("/api/v1/storage/clear", json=["../"]).status_code == 422

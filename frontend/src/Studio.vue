@@ -1,10 +1,13 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, shallowRef, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, shallowRef, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRoute, useRouter } from 'vue-router'
 import { AudioLines, Boxes, History, Layers, Library, MessagesSquare, Mic, Settings, Sparkles, Volume2 } from 'lucide-vue-next'
 import WaveSurfer from 'wavesurfer.js'
 import { Preview, recordedWav } from './audio'
+import ModelManager from './ModelManager.vue'
+import MicrophoneCapture from './MicrophoneCapture.vue'
+import StorageManager from './StorageManager.vue'
 import QueueWorkspace from './QueueWorkspace.vue'
 import { usePreferences } from './preferences'
 
@@ -32,6 +35,15 @@ const quant = ref('Q8_0')
 const selection = computed(() => models.value.filter(item => item.mode === mode.value))
 const weightsReady = computed(() => health.value?.mode === 'mock' || !!selection.value
   .find(item => item.id === model.value)?.quantizations.find(item => item.id === quant.value)?.installed)
+const generationHint = computed(() => {
+  if (!health.value) return t('正在连接本地服务…','Connecting to the local service…')
+  if (!weightsReady.value) return t('请先安装所选模型。','Install the selected model to continue.')
+  if (mode.value === 'clone' && !reference.value) return t('请先导入参考音频或录音。','Import or record a reference clip.')
+  if (mode.value === 'clone' && !xvec.value && !transcript.value.trim()) return t('填写参考音频转录，或选择 X-vector Only。','Add the reference transcript or choose X-vector Only.')
+  if (mode.value === 'design' && !instruct.value.trim()) return t('请描述想要的声音。','Describe the voice to generate.')
+  if (!text.value.trim()) return t('输入朗读文本后即可生成。','Enter a script to generate audio.')
+  return ''
+})
 const text = ref('')
 const language = ref('Auto')
 const temperature = ref(0.9)
@@ -58,19 +70,18 @@ const visibleVoices = computed(() => voices.value.filter(voice =>
 ).sort((a, b) => Number(!!b.favorite) - Number(!!a.favorite)))
 const voiceName = ref('')
 const voiceNotes = ref('')
-const recording = ref(false)
 const items = ref<Record[]>([])
 const output = ref('')
 const result = ref<Record>()
 const pending = ref('')
-const loading = ref('')
 const error = ref('')
+const notice = ref('')
+watch(mode,()=>{error.value='';notice.value='';void refresh()})
 const waveform = ref<HTMLElement>()
 let wave: WaveSurfer | undefined
 const preview = shallowRef<Preview>()
-let recorder: MediaRecorder | undefined
 let generationController: AbortController | undefined
-watch(selection, list => { if (!list.some(item => item.id === model.value)) model.value = list[0]?.id ?? '' }, { immediate: true })
+watch(selection, list => { if (list.length && !list.some(item => item.id === model.value)) model.value = list[0]?.id ?? '' }, { immediate: true })
 watch([referenceWave, referenceAudio], ([container, url], _, onCleanup) => {
   if (!container || !url) return
   const referencePlot = WaveSurfer.create({
@@ -115,6 +126,7 @@ onMounted(() => {
 })
 async function upload(file?: File) {
   if (!file) return
+  notice.value = t('正在处理参考音频…','Preparing reference audio…')
   error.value = ''
   try {
     if (!file.name.toLowerCase().endsWith('.wav')) file = await recordedWav(file)
@@ -123,8 +135,9 @@ async function upload(file?: File) {
     reference.value = (await (await api('/references', {method:'POST', body:form})).json()).id
     if (referenceAudio.value) URL.revokeObjectURL(referenceAudio.value)
     referenceAudio.value = URL.createObjectURL(file)
+    notice.value = t('参考音频已载入，可试听或裁剪。','Reference clip loaded. Preview or trim it below.')
     return true
-  } catch (e) { report(e) }
+  } catch (e) { notice.value=''; report(e) }
 }
 async function cloneFromDesign() {
   if (!result.value || !output.value) return
@@ -137,39 +150,17 @@ async function cloneFromDesign() {
     }
   } catch (e) { report(e) }
 }
+function clearReference() {
+  URL.revokeObjectURL(referenceAudio.value)
+  referenceAudio.value = ''
+  reference.value = ''
+  transcript.value = ''
+}
 async function trimReference() {
   try {
     const blob = await (await fetch(referenceAudio.value)).blob()
     await upload(await recordedWav(blob, trimStart.value, trimEnd.value))
   } catch (e) { report(e) }
-}
-async function recordReference() {
-  error.value = ''
-  if (recorder && recorder.state === 'recording') { recorder.stop(); return }
-  if (recording.value) return
-  recording.value = true
-  let source: MediaStream | undefined
-  try {
-    source = await navigator.mediaDevices.getUserMedia({audio:true})
-    const chunks: Blob[] = []
-    recorder = new MediaRecorder(source)
-    const captured = recorder
-    const stream = source
-    const timeout = window.setTimeout(() => { if (captured.state === 'recording') captured.stop() }, 90_000)
-    recorder.ondataavailable = event => { if (event.data.size) chunks.push(event.data) }
-    recorder.onstop = async () => {
-      clearTimeout(timeout)
-      stream.getTracks().forEach(track => track.stop())
-      try { await upload(await recordedWav(new Blob(chunks, {type:captured.mimeType}))) }
-      catch (e) { report(e) }
-      finally { recording.value = false }
-    }
-    recorder.start()
-  } catch (e) {
-    source?.getTracks().forEach(track => track.stop())
-    recording.value = false
-    report(e)
-  }
 }
 async function saveVoice() {
   try {
@@ -177,6 +168,7 @@ async function saveVoice() {
       name:voiceName.value, notes:voiceNotes.value, reference:reference.value,
       transcript:transcript.value, xvec:xvec.value,
     })})
+    notice.value = t('音色已保存到「我的音色」。','Voice saved to your library.')
     voiceName.value = ''
     voiceNotes.value = ''
     await refresh()
@@ -230,13 +222,19 @@ async function exportDiagnostics() {
     saveBlob(await (await api('/system/diagnostics')).blob(), 'studio-diagnostics.json')
   } catch (e) { report(e) }
 }
-async function downloadModel(id: string, q: string) {
-  loading.value = id + q
-  error.value = ''
+async function deleteClip(id:string) {
+  if (!confirm(t('永久删除这条历史记录和音频？','Permanently delete this clip and history entry?'))) return
   try {
-    await api('/models/download', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({model:id, quant:q})})
-  } catch (e) { report(e) }
-  finally { loading.value = ''; await refresh() }
+    await api('/history/'+id,{method:'DELETE'})
+    if (result.value?.id === id) {
+      wave?.destroy()
+      wave = undefined
+      URL.revokeObjectURL(output.value)
+      output.value = ''
+      result.value = undefined
+    }
+    await refresh()
+  } catch(e) { report(e) }
 }
 async function openAudio(record: Record) {
   try {
@@ -244,6 +242,7 @@ async function openAudio(record: Record) {
     if (output.value) URL.revokeObjectURL(output.value)
     output.value = URL.createObjectURL(await response.blob())
     result.value = record
+    await nextTick()
     wave?.destroy()
     if (waveform.value) wave = WaveSurfer.create({
       container: waveform.value, url: output.value, height: 44, waveColor: '#9192ae',
@@ -337,7 +336,9 @@ async function saveWorkspace(kind: 'dialogue' | 'batch', state: unknown) {
     <aside>
       <div class="brand"><AudioLines :size="23" /> <div>Faster Qwen3<small>TTS Studio</small></div></div>
       <nav>
-        <RouterLink v-for="[id, zh, en, icon] of nav" :key="id" :to="{name:id}"><component :is="icon" :size="18" />{{t(zh,en)}}</RouterLink>
+        <template v-for="([id, zh, en, icon], index) of nav" :key="id">
+          <small v-if="index === 0 || index === 3 || index === 5" class="nav-label">{{index === 0 ? t('声音创作','Create') : index === 3 ? t('项目','Projects') : t('资料与设置','Library & settings')}}</small>
+          <RouterLink :to="{name:id}"><component :is="icon" :size="18" />{{t(zh,en)}}</RouterLink></template>
       </nav>
     </aside>
     <main>
@@ -346,39 +347,28 @@ async function saveWorkspace(kind: 'dialogue' | 'batch', state: unknown) {
         <span v-if="model && selection.length">{{model}} · {{quant}}</span>
         <span class="status">{{ health?.mode === 'mock' ? t('开发模拟 · 测试音','Development mock · test tone') : health?.metalVerified ? 'Metal · MTL0' : health ? t('Metal 运行时 · 待验证','Metal runtime · awaiting verification') : t('服务未连接','Service disconnected') }}</span>
       </div></header>
-      <p v-if="error" class="error" role="alert">{{error}}</p>
+      <div v-if="error" class="error actions" role="alert">{{error}}<button @click="error=''; refresh()">{{t('刷新','Refresh')}}</button></div>
+      <p v-if="notice" class="panel" role="status">{{notice}}</p>
       <section v-if="['custom','clone','design'].includes(mode)" class="work">
-        <div class="panel editor">
-          <label>{{t('输入文本','Script')}} <textarea v-model="text" maxlength="12000" :placeholder="t('输入要朗读的文字…','Write something to speak…')" rows="10"></textarea></label>
-          <div class="actions"><span>{{text.length}} / 12000</span>
-          <button class="primary" :disabled="!!pending || !text.trim() || !weightsReady" @click="generate()">{{t('生成语音','Generate')}}</button>
-          <button v-if="pending" @click="cancel">{{t('停止生成','Cancel generation')}}</button></div>
-          <RouterLink v-if="health && !weightsReady" :to="{name:'models'}" class="model-link">
-            {{t('先下载所选模型权重','Download the selected model weights first')}}
-          </RouterLink>
-        </div>
-        <div class="panel options">
-          <label>{{t('模型','Model')}}<select v-model="model"><option v-for="item of selection" :key="item.id" :value="item.id">{{item.id}}</option></select></label>
-          <label>{{t('量化','Quantization')}}<select v-model="quant"><option>Q8_0</option><option>BF16</option><option>Q4_K_M</option></select></label>
-          <label>{{t('语言','Language')}}<select v-model="language"><option v-for="lang of ['Auto','Chinese','English','Japanese','Korean','German','French','Russian','Portuguese','Spanish','Italian']" :key="lang">{{lang}}</option></select></label>
-          <label v-if="mode === 'custom'">{{t('音色','Speaker')}}<select v-model="speaker"><option v-for="name of ['Vivian','Serena','Ryan','Aiden','Dylan','Eric','Ono_Anna','Sohee','Uncle_Fu']" :key="name">{{name}}</option></select></label>
-          <div v-if="mode === 'clone'" @dragover.prevent @drop.prevent="upload($event.dataTransfer?.files[0])">
+        <div class="panel editor stack">
+          <div v-if="mode === 'clone'" class="reference-box stack" @dragover.prevent @drop.prevent="upload($event.dataTransfer?.files[0])">
             <label v-if="voices.length">{{t('已保存音色','Saved voice')}}<select @change="useVoice(($event.target as HTMLSelectElement).value)">
               <option value="">{{t('选择音色','Choose a voice')}}</option>
               <option v-for="voice in voices" :key="voice.id" :value="voice.id">{{voice.name}}</option>
             </select></label>
-            <label>{{t('已获授权的参考音频','Authorized reference audio')}}<input type="file" accept=".wav,.mp3,.flac,.m4a,audio/*" @change="upload(($event.target as HTMLInputElement).files?.[0])"></label>
-            <button @click="recordReference">{{recording ? t('结束录音','Stop recording') : t('麦克风录音','Record microphone')}}</button>
+            <label>{{t('参考音频','Reference audio')}}<span class="drop-input">{{t('选择或拖入获授权的音频文件','Choose or drop an authorized audio file')}}<input type="file" accept=".wav,.mp3,.flac,.m4a,audio/*" @change="upload(($event.target as HTMLInputElement).files?.[0])"></span></label>
+            <MicrophoneCapture :t="t" :upload="upload" />
             <template v-if="referenceAudio">
               <div ref="referenceWave"></div>
               <audio :src="referenceAudio" controls></audio>
+              <button @click="clearReference">{{t('移除参考音频','Remove reference')}}</button>
               <div class="trim">
                 <label>{{t('起点（秒）','Start (s)')}}<input v-model.number="trimStart" type="number" min="0" step="0.01"></label>
                 <label>{{t('终点（秒）','End (s)')}}<input v-model.number="trimEnd" type="number" min="0" step="0.01"></label>
                 <button :disabled="!trimEnd || trimEnd <= trimStart" @click="trimReference">{{t('裁剪','Trim')}}</button>
               </div>
             </template>
-            <label class="check"><input v-model="xvec" type="checkbox"> X-vector Only</label>
+            <label class="check"><input v-model="xvec" type="checkbox">{{t('仅提取音色，无需转录（X-vector）','Speaker embedding only, no transcript (X-vector)')}}</label>
             <label v-if="!xvec">{{t('参考音频转录','Reference transcript')}}<textarea v-model="transcript" rows="3"></textarea></label>
             <template v-if="reference">
               <label>{{t('音色名称','Voice name')}}<input v-model="voiceName" maxlength="100"></label>
@@ -388,6 +378,15 @@ async function saveWorkspace(kind: 'dialogue' | 'batch', state: unknown) {
           </div>
           <label v-if="mode === 'design'">{{t('声音描述','Voice description')}}<textarea v-model="instruct" rows="4"></textarea></label>
           <label v-if="mode === 'custom' && model === '1.7b-customvoice'">{{t('语气描述','Delivery instruction')}}<textarea v-model="instruct" rows="3"></textarea></label>
+          <label>{{t('输入文本','Script')}} <textarea v-model="text" maxlength="12000" :placeholder="t('输入要朗读的文字…','Write something to speak…')" rows="7"></textarea></label>
+          <small>{{text.length}} / 12000</small>
+        </div>
+        <div class="panel options">
+          <h2>{{t('生成设置','Generation settings')}}</h2>
+          <label>{{t('模型','Model')}}<select v-model="model"><option v-for="item of selection" :key="item.id" :value="item.id">{{item.id}}</option></select></label>
+          <label>{{t('量化','Quantization')}}<select v-model="quant"><option>Q8_0</option><option>BF16</option><option>Q4_K_M</option></select></label>
+          <label>{{t('语言','Language')}}<select v-model="language"><option v-for="lang of ['Auto','Chinese','English','Japanese','Korean','German','French','Russian','Portuguese','Spanish','Italian']" :key="lang">{{lang}}</option></select></label>
+          <label v-if="mode === 'custom'">{{t('音色','Speaker')}}<select v-model="speaker"><option v-for="name of ['Vivian','Serena','Ryan','Aiden','Dylan','Eric','Ono_Anna','Sohee','Uncle_Fu']" :key="name">{{name}}</option></select></label>
           <details>
             <summary>{{t('高级推理参数','Advanced inference')}}</summary>
             <div class="trim">
@@ -397,6 +396,15 @@ async function saveWorkspace(kind: 'dialogue' | 'batch', state: unknown) {
               <label>{{t('最大令牌数','Max tokens')}}<input v-model.number="maxTokens" type="number" min="16" max="2048" step="1"></label>
             </div>
           </details>
+          <div class="generation-controls stack">
+          <p v-if="generationHint" class="hint">{{generationHint}}</p>
+          <div class="controls">
+          <button class="primary" :disabled="!!pending || !!generationHint" @click="generate()">{{t('生成语音','Generate')}}</button>
+          <button v-if="pending" @click="cancel">{{t('停止生成','Cancel generation')}}</button></div>
+          <RouterLink v-if="health && !weightsReady" :to="{name:'models',query:{from:mode,model,quant}}" class="model-link">
+            {{t('先下载所选模型权重','Download the selected model weights first')}}
+          </RouterLink>
+          </div>
         </div>
       </section>
       <section v-else-if="mode === 'voices'" class="stack">
@@ -416,7 +424,7 @@ async function saveWorkspace(kind: 'dialogue' | 'batch', state: unknown) {
             <button @click="updateVoice({...editVoice, tags:editTags.split(/[,，]/).map(tag => tag.trim()).filter(Boolean).slice(0,12)})">{{t('保存','Save')}}</button>
           </div>
         </div>
-        <p v-if="!voices.length">{{t('在声音克隆页面保存参考音色。','Save a reference voice from the clone workspace.')}}</p>
+        <p class="empty" v-if="!voices.length">{{t('在声音克隆页面保存参考音色。','Save a reference voice from the clone workspace.')}}</p>
         <div :class="voiceLayout === 'cards' ? 'voice-cards' : 'stack'">
           <article v-for="voice in visibleVoices" :key="voice.id" class="panel stack">
             <div class="voice-title"><span class="avatar" aria-hidden="true">{{Array.from(voice.name)[0]}}</span>
@@ -432,20 +440,17 @@ async function saveWorkspace(kind: 'dialogue' | 'batch', state: unknown) {
           </article>
           </div>
       </section>
-      <section v-else-if="mode === 'models'" class="stack">
-        <article v-for="item of models" :key="item.id" class="panel model"><strong>{{item.name}}</strong><div class="actions">
-          <button v-for="q of item.quantizations" :key="q.id" :disabled="!!loading || q.installed" @click="downloadModel(item.id,q.id)">
-            {{q.id}} · {{q.installed ? t('已安装','Installed') : loading === item.id + q.id ? t('下载中','Downloading') : t('下载','Download')}}
-          </button></div></article>
-      </section>
+      <ModelManager v-else-if="mode === 'models'" :models="models" :api="api" :refresh="refresh" :t="t" />
       <section v-else-if="mode === 'history'" class="stack">
-        <p v-if="!items.length">{{t('生成的语音将在这里显示。','Generated clips will appear here.')}}</p>
-        <article v-for="item of items" :key="item.id" class="panel model"><span>{{item.request.text.slice(0,150)}} <small v-if="item.mock">Mock</small></span><button @click="openAudio(item)">{{t('载入播放','Load audio')}}</button></article>
+        <p class="empty" v-if="!items.length">{{t('生成的语音将在这里显示。','Generated clips will appear here.')}}</p>
+        <article v-for="item of items" :key="item.id" class="panel model"><span>{{item.request.text.slice(0,150)}} <small v-if="item.mock">Mock</small></span><div class="controls"><button @click="openAudio(item)">{{t('载入播放','Load audio')}}</button><button @click="deleteClip(item.id)">{{t('删除','Delete')}}</button></div></article>
       </section>
       <section v-else-if="mode === 'settings'" class="panel options">
         <label>{{t('主题','Theme')}}<select v-model="theme"><option value="system">{{t('系统','System')}}</option><option value="light">{{t('浅色','Light')}}</option><option value="dark">{{t('深色','Dark')}}</option></select></label>
         <label>{{t('界面语言','Interface language')}}<select v-model="locale"><option value="zh">简体中文</option><option value="en">English</option></select></label>
+        <h2>{{t('本地服务','Local service')}}</h2>
         <p v-if="health">{{health.platform}} · {{health.arch}}</p>
+        <StorageManager @changed="refresh" :api="api" :t="t" :busy="!!pending" />
         <button @click="exportDiagnostics">{{t('导出系统诊断','Export system diagnostics')}}</button>
       </section>
       <QueueWorkspace v-show="mode === 'dialogue'" :dialogue="true" :chinese="locale === 'zh'" :busy="!!pending"
@@ -454,7 +459,7 @@ async function saveWorkspace(kind: 'dialogue' | 'batch', state: unknown) {
       <QueueWorkspace v-show="mode === 'batch'" :dialogue="false" :chinese="locale === 'zh'" :busy="!!pending"
         :models="models" :voices="voices" :generate="request => generate(request, false)" :export-clips="exportClips"
         :cancel="cancel" :load-workspace="() => loadWorkspace('batch')" :save-workspace="state => saveWorkspace('batch', state)" />
-      <footer class="panel player">
+      <footer v-if="output || pending || preview" class="panel player">
         <div v-show="output" ref="waveform"></div>
         <div class="actions">
           <button v-if="preview" @click="preview.toggle()">{{t('暂停或继续流式试听','Pause or resume live preview')}}</button>

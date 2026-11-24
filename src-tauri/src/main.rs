@@ -64,7 +64,7 @@ mod desktop {
         let runtime = resources.join("python");
         let mut backend = Backend(Command::new(runtime.join("bin/python3.12"))
             .arg("-B").args(["-m", "backend.main", "--root"]).arg(&root)
-            .arg("--cache").arg(&cache).arg("--web").arg(resources.join("web"))
+            .arg("--logs").arg(&logs).arg("--cache").arg(&cache).arg("--web").arg(resources.join("web"))
             .arg("--parent").arg(std::process::id().to_string())
             .current_dir(&resources)
             .env_clear()

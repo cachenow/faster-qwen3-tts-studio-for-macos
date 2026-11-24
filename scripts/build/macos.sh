@@ -49,7 +49,7 @@ report="$PWD/artifacts/BUILD-REPORT.txt"
   echo "Hardware inference validation pending"
 } > "$report"
 python3 scripts/build/check_macho.py "$app/Contents" "$report"
-"$studio/python/bin/python3.12" -B -c 'import platform, importlib.metadata as m; import fastapi; from faster_qwen3_tts import FasterQwen3TTS; from qwentts_cpp import QwenLibrary; assert platform.machine() == "arm64"; print(m.version("qwentts-cpp-python"), QwenLibrary().version())' | tee -a "$report"
+PYTHONPATH="$studio" "$studio/python/bin/python3.12" -B -c 'import platform, importlib.metadata as m; import fastapi; from backend.upstream_ggml import GGMLQwen3TTS; from qwentts_cpp import QwenLibrary; assert platform.machine() == "arm64"; print(m.version("qwentts-cpp-python"), QwenLibrary().version())' | tee -a "$report"
 codesign --force --sign - "$app"
 codesign --verify --deep --strict --verbose=2 "$app"
 
@@ -59,6 +59,7 @@ staging="$(mktemp -d "$PWD/.local/build/dmg.XXXXXX")"
 mount="$(mktemp -d "$PWD/.local/build/mount.XXXXXX")"
 trap 'hdiutil detach "$mount" >/dev/null 2>&1 || true' EXIT
 ditto "$app" "$staging/$(basename "$app")"
+install -m 755 scripts/build/uninstall.command "$staging/Uninstall Studio.command"
 ln -s /Applications "$staging/Applications"
 hdiutil create -ov -format UDZO -volname 'Faster Qwen3-TTS Studio' -srcfolder "$staging" "artifacts/$name.dmg"
 hdiutil attach -nobrowse -readonly -mountpoint "$mount" "artifacts/$name.dmg"
@@ -69,8 +70,18 @@ import subprocess
 import sys
 subprocess.run([sys.argv[1]], timeout=60, check=True)
 PY
+test -x "$mount/Uninstall Studio.command"
+/bin/bash "$mount/Uninstall Studio.command" --list >> "$report"
 hdiutil detach "$mount"
 ditto -c -k --keepParent "$app" "artifacts/$name.app.zip"
+{
+  echo 'Download sizes in bytes (DMG and alternative App ZIP):'
+  wc -c "artifacts/$name.dmg" "artifacts/$name.app.zip"
+  echo 'Installed disk usage (App, bundled Python):'
+  du -sh "$app" "$studio/python"
+  echo 'Largest Python package entries (KiB):'
+  du -sk "$studio/python/lib/python3.12/site-packages/"* | sort -nr | sed -n '1,10p'
+} | tee -a "$report"
 cp src-tauri/Cargo.lock artifacts/Cargo.lock
 cp uv.lock artifacts/uv.lock
 (cd artifacts && shasum -a 256 "$name.dmg" "$name.app.zip" > SHA256SUMS.txt)

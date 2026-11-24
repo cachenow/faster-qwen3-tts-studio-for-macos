@@ -25,11 +25,12 @@ from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field, model_validator
 
 from .catalog import VARIANTS, QUANTS, filenames, model_id
-from .downloads import DownloadPaused, download_weight, installed
+from .downloads import CATALOG, download_weight, installed
 from .engine import MetalEngine, MockEngine
 
 
 class WeightSelection(BaseModel):
+    source: Literal["official", "mirror"] = "official"
     model: Literal["0.6b-base", "1.7b-base", "0.6b-customvoice", "1.7b-customvoice", "1.7b-voicedesign"]
     quant: Literal["BF16", "Q8_0", "Q4_K_M"]
 
@@ -166,7 +167,32 @@ def infer(pipe, root, cache, data, mock):
         pipe.close()
 
 
-def create_app(root: Path, token: str, mock=False, cache: Path | None = None):
+class StorageAccess:
+    """Keep destructive cleanup exclusive until concurrent responses finish using files."""
+    def __init__(self, app):
+        self.app = app
+        self.in_use = 0
+        self.cleaning = False
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        if scope["type"] != "http" or not path.startswith("/api/v1/") or path == "/api/v1/health":
+            return await self.app(scope, receive, send)
+        clean = scope["method"] == "POST" and path in ("/api/v1/storage/clear", "/api/v1/storage/cache/clear")
+        if self.cleaning or (clean and self.in_use):
+            return await JSONResponse({"detail": "Files are in use. Retry after the current operation."}, 409)(scope, receive, send)
+        self.in_use += 1
+        if clean:
+            self.cleaning = True
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            self.in_use -= 1
+            if clean:
+                self.cleaning = False
+
+
+def create_app(root: Path, token: str, mock=False, cache: Path | None = None, logs: Path | None = None):
     root = root.resolve()
     cache = (cache or root / "cache").resolve()
     for folder in ("outputs", "voices", "database", "models", "config", "runtime"):
@@ -185,9 +211,9 @@ def create_app(root: Path, token: str, mock=False, cache: Path | None = None):
             db.execute("PRAGMA user_version = 4")
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app.add_middleware(StorageAccess)
     active = {}
-    download_lock = asyncio.Lock()
-    download_paused = threading.Event()
+    download_task = None
     download_status = {}
     confirmed_metal = False
     api = "/api/v1"
@@ -216,8 +242,8 @@ def create_app(root: Path, token: str, mock=False, cache: Path | None = None):
         import importlib.metadata
         import sys
 
-        versions = {}
-        for package in ("faster-qwen3-tts", "qwentts-cpp-python"):
+        versions = {"faster-qwen3-tts": "0.5.4 (GGML adapter)"}
+        for package in ("qwentts-cpp-python",):
             try:
                 versions[package] = importlib.metadata.version(package)
             except importlib.metadata.PackageNotFoundError:
@@ -239,16 +265,83 @@ def create_app(root: Path, token: str, mock=False, cache: Path | None = None):
                        (preferences.model_dump_json(),))
         return preferences
 
+    def data_files(group):
+        locations = {"models": root / "models", "partials": root / "models", "voices": root / "voices",
+                     "outputs": root / "outputs", "unused": root / "voices", "cache": cache, "logs": logs}
+        directory = locations[group]
+        if not directory or not directory.exists():
+            return []
+        if directory.is_symlink():
+            raise HTTPException(409, "Data directory is a symbolic link")
+        paths = list(directory.iterdir())
+        if group == "unused":
+            with closing(sqlite3.connect(database)) as db:
+                saved = {json.loads(raw)["reference"] for raw, in db.execute("SELECT data FROM voices")}
+            return [p for p in paths if p.suffix == ".wav" and p.stem not in saved]
+        if group == "partials":
+            return [p for p in paths if p.suffix == ".part"]
+        if group == "models":
+            return [p for p in paths if p.suffix in (".gguf", ".verified")]
+        if group == "logs":
+            return [p for p in paths if p.name in ("backend.log", "backend.previous.log")]
+        return paths
+
     @app.get(api + "/storage")
     def storage():
-        def size(directory):
-            return sum(path.stat().st_size for path in directory.rglob("*")
-                       if path.is_file() and not path.is_symlink())
+        def size(path):
+            try:
+                if path.is_symlink():
+                    return 0
+                if path.is_dir():
+                    return sum(size(child) for child in path.iterdir())
+                return path.stat().st_size
+            except FileNotFoundError:
+                return 0
 
-        return {name: size(directory) for name, directory in {
-            "models": root / "models", "voices": root / "voices", "outputs": root / "outputs",
-            "database": root / "database", "cache": cache,
-        }.items()}
+        return {**{key: sum(size(p) for p in data_files(key))
+                   for key in ("models", "partials", "voices", "unused", "outputs", "cache", "logs")},
+                "database": size(database)}
+
+    @app.post(api + "/storage/clear")
+    def clear_selected(groups: list[Literal["models","partials","voices","unused","outputs","cache","logs","workspaces","settings"]]):
+        if active or download_status.get("active"):
+            raise HTTPException(409, "Stop generation and pause downloads before cleaning data")
+        with closing(sqlite3.connect(database)) as db, db:
+            for group in set(groups):
+                if group not in ("settings", "workspaces"):
+                    for path in data_files(group):
+                        if path.is_symlink():
+                            path.unlink()
+                        elif group == "logs" and path.name == "backend.log":
+                            with path.open("wb"):
+                                pass
+                        elif path.is_dir():
+                            shutil.rmtree(path)
+                        else:
+                            path.unlink(missing_ok=True)
+                table = {"voices":"voices", "outputs":"history", "settings":"settings", "workspaces":"workspaces"}.get(group)
+                if table:
+                    db.execute(f"DELETE FROM {table}")
+            if "workspaces" not in groups and ("voices" in groups or "outputs" in groups):
+                for kind, raw in db.execute("SELECT kind,data FROM workspaces").fetchall():
+                    workspace = json.loads(raw)
+                    if "outputs" in groups:
+                        for row in workspace["rows"]:
+                            row["result"] = None
+                    if "voices" in groups:
+                        for role in workspace["roles"]:
+                            try:
+                                UUID(role["voice"])
+                            except ValueError:
+                                continue
+                            role["voice"] = "Vivian"
+                    db.execute("UPDATE workspaces SET data=? WHERE kind=?", (json.dumps(workspace),kind))
+            db.commit()
+            if any(key in groups for key in ("voices","outputs","settings","workspaces")):
+                db.execute("VACUUM")
+        if "models" in groups or "partials" in groups:
+            download_status.clear()
+        return {"cleared": groups}
 
     @app.post(api + "/storage/cache/clear")
     async def clear_cache():
@@ -265,47 +358,68 @@ def create_app(root: Path, token: str, mock=False, cache: Path | None = None):
     @app.get(api + "/models")
     def models():
         return [{"id": variant, "name": model_id(variant), "mode": mode,
-                 "quantizations": [{"id": q, "installed": all(
+                 "quantizations": [{"id": q, "downloadBytes": sum(CATALOG["files"][n]["bytes"] for n in filenames(variant, q) if not installed(root / "models", n)), "installed": all(
                      installed(root / "models", n) for n in filenames(variant, q)
                  )} for q in QUANTS]} for variant, mode in VARIANTS.items()]
 
-    @app.post(api + "/models/download")
-    async def download(selection: WeightSelection):
-        if download_lock.locked():
-            raise HTTPException(409, "Another model download is active")
-        async with download_lock:
-            download_paused.clear()
-            download_status.clear()
+    async def transfer(selection):
+        def progress(name, offset, total):
+            now = time.monotonic()
+            if download_status["total"] == 0 or offset < download_status["received"]:
+                download_status.update(started=now, initial=offset)
+            speed = (offset - download_status["initial"]) / max(now - download_status["started"], 0.1)
+            download_status.update(received=offset, total=total, bytesPerSecond=speed)
 
-            def progress(name, offset, total):
-                now = time.monotonic()
-                if download_status.get("file") != name or offset < download_status.get("received", 0):
-                    download_status.update(file=name, started=now, initial=offset)
-                speed = (offset - download_status["initial"]) / max(now - download_status["started"], 0.1)
-                download_status.update(received=offset, total=total, bytesPerSecond=speed)
-
-            try:
+        try:
+            for index, name in enumerate(filenames(selection.model, selection.quant), 1):
+                download_status.update(file=name, part=index, received=0, total=0, bytesPerSecond=0)
+                await download_weight(root / "models", name, progress, selection.source)
+            download_status["state"] = "complete"
+        except asyncio.CancelledError:
+            if download_status["state"] == "cancelling":
                 for name in filenames(selection.model, selection.quant):
-                    await asyncio.to_thread(download_weight, root / "models", name, progress, download_paused)
-            except DownloadPaused:
-                return {"paused": True}
-            except (OSError, ValueError):
-                raise HTTPException(502, "Model download or integrity check failed. Retry to resume.") from None
-        return {"model": selection.model, "quant": selection.quant}
+                    (root / "models" / name).with_suffix(".part").unlink(missing_ok=True)
+                download_status.update(state="cancelled", received=0, total=0)
+            else:
+                download_status["state"] = "paused"
+        except Exception as exc:
+            download_status.update(state="failed", error=str(exc) or type(exc).__name__)
+        finally:
+            download_status["active"] = False
+
+    @app.post(api + "/models/download", status_code=202)
+    async def download(selection: WeightSelection):
+        nonlocal download_task
+        if download_status.get("active"):
+            raise HTTPException(409, "Another model download is active")
+        download_status.clear()
+        download_status.update(active=True, state="downloading", source=selection.source, model=selection.model, quant=selection.quant,
+                               received=0, total=0, part=1, bytesPerSecond=0)
+        download_task = asyncio.create_task(transfer(selection))
+        return dict(download_status)
 
     @app.get(api + "/models/download")
     async def download_progress():
-        return {"active": download_lock.locked(), **download_status}
+        return {"active": False, **download_status}
 
     @app.post(api + "/models/download/pause")
     async def pause_download():
-        download_paused.set()
-        return {"paused": True}
+        if download_status.get("active") and download_task and download_status["state"] == "downloading":
+            download_task.cancel()
+            download_status["state"] = "pausing"
+        return dict(download_status)
+
+    @app.post(api + "/models/download/cancel")
+    async def cancel_download():
+        if download_status.get("active") and download_task and download_status["state"] == "downloading":
+            download_status["state"] = "cancelling"
+            download_task.cancel()
+        return dict(download_status)
 
     @app.delete(api + "/models/{variant}/{quant}")
     async def delete_weights(variant: str, quant: str):
         selection = WeightSelection.model_validate({"model": variant, "quant": quant})
-        if active or download_lock.locked():
+        if active or download_status.get("active"):
             raise HTTPException(409, "Stop generation or download before removing a model")
         talker, codec = filenames(selection.model, selection.quant)
         shared = any(other != variant and installed(root / "models", filenames(other, quant)[0])
@@ -314,6 +428,8 @@ def create_app(root: Path, token: str, mock=False, cache: Path | None = None):
             path = root / "models" / name
             for target in (path, path.with_suffix(".verified"), path.with_suffix(".part")):
                 target.unlink(missing_ok=True)
+        if download_status.get("model") == variant and download_status.get("quant") == quant:
+            download_status.clear()
         return {"model": variant, "quant": quant}
 
     def write_reference(content: bytes):
@@ -597,6 +713,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--cache", type=Path)
+    parser.add_argument("--logs", type=Path)
     parser.add_argument("--web", type=Path, required=True)
     parser.add_argument("--mock", action="store_true")
     parser.add_argument("--parent", type=int)
@@ -614,7 +731,7 @@ def main():
 
         threading.Thread(target=watch_parent, daemon=True).start()
     token = secrets.token_urlsafe(32)
-    app = create_app(args.root, token, args.mock, args.cache)
+    app = create_app(args.root, token, args.mock, args.cache, args.logs)
 
     @app.get("/")
     def index():

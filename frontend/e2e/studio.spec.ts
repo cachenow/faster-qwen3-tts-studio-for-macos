@@ -5,6 +5,8 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { test, expect } from '@playwright/test'
 
+test.use({launchOptions:{args:['--use-fake-device-for-media-stream','--use-fake-ui-for-media-stream']}})
+
 let backend: ChildProcess
 let directory: string
 let url: string
@@ -68,6 +70,67 @@ test('cancels an active generation and releases the worker', async ({page}) => {
   await expect(page.getByRole('link', {name:'Export WAV'})).toHaveCount(0)
 })
 
+test('pauses, resumes and retries a model transfer', async ({page}) => {
+  let state = 'idle'
+  const active = () => state === 'downloading'
+  await page.addInitScript(() => localStorage.setItem('studio-language','en'))
+  await page.route('**/models/download**', async route => {
+    if (route.request().method() === 'POST') state = route.request().url().endsWith('/pause') ? 'paused' : 'downloading'
+    await route.fulfill({json:state === 'idle' ? {active:false} : {active:active(), state, model:'0.6b-base', quant:'BF16', file:'talker.gguf', part:1, total:100, received:40, bytesPerSecond:5, error:state === 'failed' ? 'HTTP 503' : ''}})
+  })
+  await page.goto(url+'/#/models')
+  await page.getByRole('button',{name:/BF16 · Download/}).first().click()
+  await expect(page.getByText(/40%/)).toBeVisible()
+  await page.getByRole('button',{name:'Pause download'}).click()
+  await page.getByRole('button',{name:'Resume download'}).click()
+  await expect(page.getByRole('button',{name:'Pause download'})).toBeVisible()
+  state = 'failed'
+  await expect(page.getByRole('alert')).toContainText('HTTP 503')
+  await page.getByRole('button',{name:'Retry download'}).click()
+  await expect(page.getByRole('button',{name:'Pause download'})).toBeVisible()
+})
+
+test.describe('microphone review', () => {
+
+  test('selects a device, records, discards and accepts a new take', async ({page,context}) => {
+    await context.grantPermissions(['microphone'],{origin:url})
+    await page.addInitScript(()=>localStorage.setItem('studio-language','en'))
+    let uploads=0
+    page.on('request',r=>{if(r.url().endsWith('/references') && r.method()==='POST') uploads++})
+    await page.goto(url+'/#/clone')
+    async function take(){
+      await page.getByRole('button',{name:'Choose microphone'}).click()
+      await expect(page.getByLabel('Recording device')).toBeVisible()
+      await page.getByRole('button',{name:'Start recording'}).click()
+      await expect(page.getByText(/Recording · 1 \/ 90 s/)).toBeVisible()
+      await page.getByRole('button',{name:'Stop and review'}).click()
+    }
+    await take()
+    await page.getByRole('button',{name:'Discard',exact:true}).click()
+    expect(uploads).toBe(0)
+    await take()
+    await page.getByRole('button',{name:'Use this recording'}).click()
+    await expect(page.getByRole('button',{name:'Remove reference'})).toBeVisible()
+    expect(uploads).toBe(1)
+  })
+})
+
+
+test('previews selective storage cleanup and respects cancellation',async({page})=>{
+  await page.addInitScript(()=>localStorage.setItem('studio-language','en'))
+  await page.goto(url+'/#/settings')
+  const clear=page.getByRole('button',{name:/Clear selected data/})
+  await expect(clear).toBeDisabled()
+  await page.getByRole('checkbox',{name:/Partial downloads/}).check()
+  page.once('dialog',d=>d.dismiss())
+  await clear.click()
+  await expect(clear).toBeEnabled()
+  page.once('dialog',d=>d.accept())
+  await clear.click()
+  await expect(page.getByText('Selected data cleared.')).toBeVisible()
+  await expect(clear).toBeDisabled()
+})
+
 test('runs a two-item batch and exports a ZIP', async ({page}) => {
   await page.addInitScript(() => localStorage.setItem('studio-language', 'en'))
   await page.goto(url)
@@ -79,5 +142,8 @@ test('runs a two-item batch and exports a ZIP', async ({page}) => {
   await expect(exportButton).toBeEnabled({timeout: 15000})
   const download = page.waitForEvent('download')
   await exportButton.click()
-  expect((await download).suggestedFilename()).toBe('batch.zip')
+  const archive = await download
+  expect(archive.suggestedFilename()).toBe('batch.zip')
+  expect(await archive.failure()).toBeNull()
+  await archive.delete()
 })

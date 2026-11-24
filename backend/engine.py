@@ -24,17 +24,14 @@ class MetalEngine:
             raise RuntimeError("Metal requires native macOS ARM64")
         os.environ["GGML_BACKEND"] = "MTL0"
         os.environ["HF_HUB_OFFLINE"] = "1"
-        from faster_qwen3_tts import FasterQwen3TTS
+        from .upstream_ggml import GGMLQwen3TTS
 
         key = (model_id, talker, codec)
         if self.key != key:
             self.unload()
             self.cache.mkdir(parents=True, exist_ok=True)
             os.environ["FQWEN3TTS_QWENTTS_REF_CACHE_DIR"] = str(self.cache)
-            self.model = FasterQwen3TTS.from_pretrained(
-                model_id, backend="ggml", gguf_talker_path=str(talker),
-                gguf_codec_path=str(codec), local_files_only=True,
-            )
+            self.model = GGMLQwen3TTS.from_gguf(talker, codec, voice_ref_cache_dir=self.cache)
             self.key = key
 
         method = {
