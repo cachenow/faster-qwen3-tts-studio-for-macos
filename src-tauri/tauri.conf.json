@@ -1,0 +1,14 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Faster Qwen3-TTS Studio",
+  "version": "0.1.0",
+  "identifier": "studio.fasterqwen3tts.desktop",
+  "build": {"frontendDist": "../frontend/dist"},
+  "app": {"windows": [], "security": {"capabilities": []}},
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "icon": ["icons/icon.icns", "icons/icon.png"],
+    "macOS": {"minimumSystemVersion": "14.0"}
+  }
+}
