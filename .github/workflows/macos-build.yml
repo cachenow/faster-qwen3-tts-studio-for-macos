@@ -1,0 +1,31 @@
+name: macOS ARM64 Build
+on:
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - run: test "$(uname -m)" = arm64
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.11.1
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: 0.9.9
+          enable-cache: false
+      - run: rustup toolchain install 1.93.0 --profile minimal --target aarch64-apple-darwin
+      - run: bash scripts/build/macos.sh
+        env:
+          RUSTUP_TOOLCHAIN: 1.93.0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Faster-Qwen3-TTS-Studio-arm64
+          path: artifacts/
+          if-no-files-found: error

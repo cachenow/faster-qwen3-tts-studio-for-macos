@@ -1,0 +1,36 @@
+name: Release Preview
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag selected as the workflow ref
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  build:
+    if: github.ref_type == 'tag' && (github.event_name == 'push' || inputs.tag == github.ref_name)
+    uses: ./.github/workflows/macos-build.yml
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: Faster-Qwen3-TTS-Studio-arm64
+          path: artifacts
+      - name: Publish pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          test "$RELEASE_TAG" = "v$version"
+          gh release create "$RELEASE_TAG" --verify-tag --prerelease --notes-file CHANGELOG.md \
+            artifacts/*.dmg artifacts/*.app.zip artifacts/SHA256SUMS.txt artifacts/BUILD-REPORT.txt

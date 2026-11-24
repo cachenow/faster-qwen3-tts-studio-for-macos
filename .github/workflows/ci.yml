@@ -1,0 +1,39 @@
+name: Studio CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.11.1
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: 0.9.9
+      - run: npm --prefix frontend ci
+      - run: npm --prefix frontend run lint
+      - run: npm --prefix frontend run test
+      - run: npm --prefix frontend run build
+      - run: uv run --locked --python 3.12.12 pytest
+      - run: npm --prefix frontend run test:e2e
+  rust:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.11.1
+      - run: rustup toolchain install 1.93.0 --profile minimal
+      - run: npm --prefix frontend ci
+      - run: npm --prefix frontend run build
+      - run: |
+          python3 scripts/build/icon.py .local/icon.iconset
+          mkdir -p src-tauri/icons
+          cp .local/icon.iconset/icon_128x128.png src-tauri/icons/icon.png
+          iconutil -c icns .local/icon.iconset -o src-tauri/icons/icon.icns
+      - run: cargo +1.93.0 check --locked --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin
