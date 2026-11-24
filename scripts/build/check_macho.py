@@ -44,7 +44,7 @@ def main():
 
     with report_file.open("a", encoding="utf-8") as report:
         for path, description in native:
-            subprocess.run(["lipo", "-verify_arch", "arm64", path], check=True)
+            subprocess.run(["lipo", path, "-verify_arch", "arm64"], check=True)
             target = output("vtool", "-arch", "arm64", "-show-build", path)
             versions = re.findall(r"\b(?:minos|version)\s+(\d+(?:\.\d+)+)", target)
             if not versions or any(tuple(map(int, item.split("."))) > (14, 0, 0) for item in versions):
