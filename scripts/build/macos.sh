@@ -27,7 +27,9 @@ mkdir -p "$studio"
 ditto "$python_home" "$studio/python"
 ditto frontend/dist "$studio/web"
 ditto backend "$studio/backend"
-cp THIRD_PARTY_NOTICES.md "$studio/"
+if [[ -f THIRD_PARTY_NOTICES.md ]]; then
+  cp THIRD_PARTY_NOTICES.md "$studio/"
+fi
 ditto licenses "$studio/licenses"
 python3 scripts/build/collect_licenses.py "$studio/licenses"
 uv export --frozen --no-dev --extra metal --no-emit-project --format requirements-txt -o .local/build/runtime.txt
